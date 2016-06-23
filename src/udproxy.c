@@ -193,7 +193,7 @@ static void rm_timeout_client(uv_timer_t* handle)
 			uv_udp_recv_stop(&elt->local_sock);
 			uv_close((uv_handle_t*) &elt->local_sock, NULL);
 
-			if(elt->queuing_data_head)
+			if (elt->queuing_data_head)
 			{
 				ClientTqItem * elt2, *tmp;
 				DL_FOREACH_SAFE(elt->queuing_data_head,elt2,tmp)
@@ -492,13 +492,13 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		ep->remote_addr = ip4h->daddr;
 		ep->remote_port = udph->dest;
 		//for local devel test
-		ep->remote_port = htons(55555);
+//		ep->remote_port = htons(55555);
 
 		//send Handshake packet
 		uv_udp_send(malloc(sizeof(uv_udp_send_t)), &map->local_sock, &handshake_buf, 1, &proxy_sockaddr, on_send);
 	}
 	//save data to waiting list and send Handshake packet again
-	else if(map->queuing_data_head)
+	else if (map->queuing_data_head)
 	{
 		//append to waiting list
 		ClientTqItem * queuing_data = malloc(sizeof(ClientTqItem));
@@ -514,7 +514,7 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		ep->remote_addr = ip4h->daddr;
 		ep->remote_port = udph->dest;
 		//for local devel test
-		ep->remote_port = htons(55555);
+//		ep->remote_port = htons(55555);
 
 		//send Handshake packet
 		uv_udp_send(malloc(sizeof(uv_udp_send_t)), &map->local_sock, &handshake_buf, 1, &proxy_sockaddr, on_send);
