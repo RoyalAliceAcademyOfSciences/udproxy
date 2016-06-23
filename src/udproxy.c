@@ -381,8 +381,6 @@ static void on_read_from_proxy(uv_udp_t* handle, ssize_t nread, const uv_buf_t* 
 		return;
 	}
 
-	LOG("entering on_read_from_proxy()\n");
-
 	ClientPortMap * map;
 	DL_SEARCH(client_map_head, map, handle, client_find_by_sock)
 			;
@@ -393,7 +391,7 @@ static void on_read_from_proxy(uv_udp_t* handle, ssize_t nread, const uv_buf_t* 
 		//is Handshake packet, timeout do NOT need update
 		if (map->queuing_data_head && nread == sizeof(EstablishPacket) && ep->magic_number == UDPROXY_MN)
 		{
-			LOG("remote server ok.\n");
+			LOG("RECV  HS PKT: 0x%08x %05d\n", ep->remote_addr, ntohs(ep->remote_port));
 
 			ClientTqItem * elt, *tmp;
 			DL_FOREACH_SAFE(map->queuing_data_head,elt,tmp)
@@ -417,7 +415,9 @@ static void on_read_from_proxy(uv_udp_t* handle, ssize_t nread, const uv_buf_t* 
 			struct sockaddr_in daddr_in;
 			bzero(&daddr_in, sizeof(daddr_in));
 			daddr_in.sin_family = AF_INET;
+			daddr_in.sin_addr.s_addr = daddr;
 
+			LOG("RAW SOCK SED: F[0x%08x %05d] T[0x%08x %05d]\n", saddr, ntohs(sport), daddr, ntohs(dport));
 			if (sendto(raw_sock, udp_packet, udp_packet_size, 0, (struct sockaddr *) &daddr_in, (socklen_t) sizeof(daddr_in)) < 0)
 				ERROR("raw socket sendto()\n");
 
@@ -435,12 +435,10 @@ static void on_read_from_proxy(uv_udp_t* handle, ssize_t nread, const uv_buf_t* 
 
 static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_data *nfa, void *data)
 {
-	LOG("entering nfqueue callback\n");
-
 	struct nfqnl_msg_packet_hdr *ph = nfq_get_msg_packet_hdr(nfa);
 	uint id = ntohl(ph->packet_id);
 
-	LOG("HWP:0x%04x HOK:%u ID:%u\n", ntohs(ph->hw_protocol), ph->hook, id);
+	LOG("NFQUE HWP:0x%04x HOK:%u ID:%u\n", ntohs(ph->hw_protocol), ph->hook, id);
 
 	u_char *pkg_data;
 	uint pkg_data_len = nfq_get_payload(nfa, &pkg_data);
@@ -490,8 +488,8 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		ep->magic_number = UDPROXY_MN;
 		ep->remote_addr = ip4h->daddr;
 		ep->remote_port = udph->dest;
-		//for local devel test
-//		ep->remote_port = htons(55555);
+
+		LOG("F SED HS PKT: 0x%08x %05d\n", ep->remote_addr, ntohs(ep->remote_port));
 
 		//send Handshake packet
 		uv_udp_send(malloc(sizeof(uv_udp_send_t)), &map->local_sock, &handshake_buf, 1, &proxy_sockaddr, on_send);
@@ -512,8 +510,8 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		ep->magic_number = UDPROXY_MN;
 		ep->remote_addr = ip4h->daddr;
 		ep->remote_port = udph->dest;
-		//for local devel test
-//		ep->remote_port = htons(55555);
+
+		LOG("R SED HS PKT: 0x%08x %05d\n", ep->remote_addr, ntohs(ep->remote_port));
 
 		//send Handshake packet
 		uv_udp_send(malloc(sizeof(uv_udp_send_t)), &map->local_sock, &handshake_buf, 1, &proxy_sockaddr, on_send);
@@ -537,10 +535,7 @@ static void on_nfqueue_readable(uv_poll_t* handle, int status, int events)
 	char buf[4096] __attribute__ ((aligned));
 
 	if ((rv = recv(handle->io_watcher.fd, buf, sizeof(buf), 0)) && rv >= 0)
-	{
-		LOG("pkt received\n");
 		nfq_handle_packet(handle->data, buf, rv);
-	}
 }
 
 void as_server()
