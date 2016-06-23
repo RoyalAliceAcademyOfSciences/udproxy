@@ -394,7 +394,6 @@ static void on_read_from_proxy(uv_udp_t* handle, ssize_t nread, const uv_buf_t* 
 		if (map->queuing_data_head && nread == sizeof(EstablishPacket) && ep->magic_number == UDPROXY_MN)
 		{
 			LOG("remote server ok.\n");
-			free(buf->base);
 
 			ClientTqItem * elt, *tmp;
 			DL_FOREACH_SAFE(map->queuing_data_head,elt,tmp)
