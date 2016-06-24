@@ -1,0 +1,6 @@
+[submodule "jni/libnfnetlink"]
+	path = jni/libnfnetlink
+	url = git://git.netfilter.org/libnfnetlink
+[submodule "jni/libnetfilter_queue"]
+	path = jni/libnetfilter_queue
+	url = git://git.netfilter.org/libnetfilter_queue
