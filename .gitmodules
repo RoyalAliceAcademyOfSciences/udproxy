@@ -4,3 +4,6 @@
 [submodule "jni/libnetfilter_queue"]
 	path = jni/libnetfilter_queue
 	url = git://git.netfilter.org/libnetfilter_queue
+[submodule "jni/libuv"]
+	path = jni/libuv
+	url = https://github.com/libuv/libuv.git
