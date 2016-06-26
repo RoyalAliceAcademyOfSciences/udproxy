@@ -63,14 +63,15 @@ typedef struct clientTransmissionQueuing
 
 typedef struct clientAddr
 {
-	uint ipaddr;
-	ushort port;
+	uint ipaddr_local;
+	ushort port_local;
+	uint ipaddr_remote;
+	ushort port_remote;
 } ClientAddr;
 
 typedef struct clientPortMap
 {
-	ClientAddr nfqueue_local;
-	ClientAddr nfqueue_remote;
+	ClientAddr peer_addr;
 	//connect to proxy, local side socket.
 	uv_udp_t local_sock;
 	u_char new;
@@ -112,9 +113,9 @@ static void on_send(uv_udp_send_t* req, int status)
 	free(req);
 }
 
-static int client_find_by_addr(ClientPortMap * e, ClientAddr * nfqueue_local)
+static int client_find_by_addr(ClientPortMap * e, ClientAddr * peer_addr)
 {
-	return memcmp(&e->nfqueue_local, nfqueue_local, sizeof(ClientAddr));
+	return memcmp(&e->peer_addr, peer_addr, sizeof(ClientAddr));
 }
 
 static int client_find_by_sock(ClientPortMap * e, uv_udp_t * local_sock)
@@ -407,8 +408,8 @@ static void on_read_from_proxy(uv_udp_t* handle, ssize_t nread, const uv_buf_t* 
 		}
 		else
 		{
-			uint saddr = map->nfqueue_remote.ipaddr, daddr = map->nfqueue_local.ipaddr;
-			ushort sport = map->nfqueue_remote.port, dport = map->nfqueue_local.port;
+			uint saddr = map->peer_addr.ipaddr_remote, daddr = map->peer_addr.ipaddr_local;
+			ushort sport = map->peer_addr.port_remote, dport = map->peer_addr.port_local;
 			size_t udp_packet_size;
 			char * udp_packet = proxy_get_udp_packet(buf->base, nread, &udp_packet_size, saddr, daddr, sport, dport);
 
@@ -450,13 +451,17 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 	uv_buf_t buf = uv_buf_init(malloc(udp_size), udp_size);
 	memcpy(buf.base, udp_data, udp_size);
 
-	ClientAddr nfqueue_local;
-	nfqueue_local.ipaddr = ip4h->saddr;
-	nfqueue_local.port = udph->source;
+	//save IP & port
+	ClientAddr peer_addr;
+	peer_addr.ipaddr_local = ip4h->saddr;
+	peer_addr.port_local = udph->source;
+	peer_addr.ipaddr_remote = ip4h->daddr;
+	peer_addr.port_remote = udph->dest;
+
 //	LOG("UDP size: %d\n", udp_size);
 
 	ClientPortMap * map;
-	DL_SEARCH(client_map_head, map, &nfqueue_local, client_find_by_addr)
+	DL_SEARCH(client_map_head, map, &peer_addr, client_find_by_addr)
 			;
 
 	if (!map)
@@ -466,11 +471,7 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		DL_APPEND(client_map_head, map);
 
 		map->new = 1;
-		map->nfqueue_local = nfqueue_local;
-
-		//save remote IP & port
-		map->nfqueue_remote.ipaddr = ip4h->daddr;
-		map->nfqueue_remote.port = udph->dest;
+		map->peer_addr = peer_addr;
 
 		uv_udp_init(loop, &map->local_sock);
 		uv_udp_recv_start(&map->local_sock, alloc_buffer, on_read_from_proxy);
