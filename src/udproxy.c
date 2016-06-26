@@ -55,12 +55,6 @@ typedef struct proxyPortMap
 	struct proxyPortMap *next, *prev;
 } ProxyPortMap;
 
-typedef struct clientTransmissionQueuing
-{
-	uv_buf_t buf;
-	struct clientTransmissionQueuing *next, *prev;
-} ClientTqItem;
-
 typedef struct clientAddr
 {
 	uint ipaddr_local;
@@ -75,7 +69,8 @@ typedef struct clientPortMap
 	//connect to proxy, local side socket.
 	uv_udp_t local_sock;
 	u_char new;
-	ClientTqItem * queuing_data_head;
+	u_char unhandshaked;
+	uv_buf_t waiting_handshake_data;
 	struct timeval timeout;
 	struct clientPortMap *next, *prev;
 } ClientPortMap;
@@ -193,21 +188,6 @@ static void rm_timeout_client(uv_timer_t* handle)
 				client_map_head = NULL;
 			uv_udp_recv_stop(&elt->local_sock);
 			uv_close((uv_handle_t*) &elt->local_sock, NULL);
-
-			if (elt->queuing_data_head)
-			{
-				ClientTqItem * elt2, *tmp;
-				DL_FOREACH_SAFE(elt->queuing_data_head,elt2,tmp)
-				{
-					if (elt2->prev)
-						DL_DELETE(elt->queuing_data_head, elt2);
-					else
-						elt->queuing_data_head = NULL;
-					free(elt2->buf.base);
-					free(elt2);
-				}
-			}
-
 			free(elt);
 		}
 	}
@@ -390,21 +370,11 @@ static void on_read_from_proxy(uv_udp_t* handle, ssize_t nread, const uv_buf_t* 
 	{
 		EstablishPacket * ep = (EstablishPacket*) buf->base;
 		//is Handshake packet, timeout do NOT need update
-		if (map->queuing_data_head && nread == sizeof(EstablishPacket) && ep->magic_number == UDPROXY_MN)
+		if (map->unhandshaked && nread == sizeof(EstablishPacket) && ep->magic_number == UDPROXY_MN)
 		{
-			LOG("RECV  HS PKT: 0x%08x %05d\n", ep->remote_addr, ntohs(ep->remote_port));
-
-			ClientTqItem * elt, *tmp;
-			DL_FOREACH_SAFE(map->queuing_data_head,elt,tmp)
-			{
-				uv_udp_send(malloc(sizeof(uv_udp_send_t)), &map->local_sock, &elt->buf, 1, &proxy_sockaddr, NULL);
-
-				if (elt->prev)
-					DL_DELETE(map->queuing_data_head, elt);
-				else
-					map->queuing_data_head = NULL;
-				free(elt);
-			}
+			map->unhandshaked = 0;
+			LOG("RECV HS PKT: 0x%08x %05d\n", ep->remote_addr, ntohs(ep->remote_port));
+			uv_udp_send(malloc(sizeof(uv_udp_send_t)), &map->local_sock, &map->waiting_handshake_data, 1, &proxy_sockaddr, NULL);
 		}
 		else
 		{
@@ -448,8 +418,6 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 
 	u_char *udp_data = ((u_char*) udph) + sizeof(struct udphdr);
 	size_t udp_size = pkg_data_len - sizeof(struct udphdr) - (ip4h->ihl * 4);
-	uv_buf_t buf = uv_buf_init(malloc(udp_size), udp_size);
-	memcpy(buf.base, udp_data, udp_size);
 
 	//save IP & port
 	ClientAddr peer_addr;
@@ -471,39 +439,20 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		DL_APPEND(client_map_head, map);
 
 		map->new = 1;
+		map->unhandshaked = 1;
 		map->peer_addr = peer_addr;
 
 		uv_udp_init(loop, &map->local_sock);
 		uv_udp_recv_start(&map->local_sock, alloc_buffer, on_read_from_proxy);
 
-		//create waiting list
-		ClientTqItem * queuing_data = malloc(sizeof(ClientTqItem));
-		bzero(queuing_data, sizeof(ClientTqItem));
-		DL_APPEND(map->queuing_data_head, queuing_data);
-		//waiting send before shakinghand
-		queuing_data->buf = buf;
-
-		//create Handshake packet
-		uv_buf_t handshake_buf = uv_buf_init(malloc(sizeof(EstablishPacket)), sizeof(EstablishPacket));
-		EstablishPacket * ep = (EstablishPacket*) handshake_buf.base;
-		ep->magic_number = UDPROXY_MN;
-		ep->remote_addr = ip4h->daddr;
-		ep->remote_port = udph->dest;
-
-		LOG("F SED HS PKT: 0x%08x %05d\n", ep->remote_addr, ntohs(ep->remote_port));
-
-		//send Handshake packet
-		uv_udp_send(malloc(sizeof(uv_udp_send_t)), &map->local_sock, &handshake_buf, 1, &proxy_sockaddr, on_send);
+		map->waiting_handshake_data.base = malloc(4096);
 	}
-	//save data to waiting list and send Handshake packet again
-	else if (map->queuing_data_head)
+
+	//save data to waiting buffer and send Handshake packet
+	if (map->unhandshaked)
 	{
-		//append to waiting list
-		ClientTqItem * queuing_data = malloc(sizeof(ClientTqItem));
-		bzero(queuing_data, sizeof(ClientTqItem));
-		DL_APPEND(map->queuing_data_head, queuing_data);
-		//waiting send before shakinghand
-		queuing_data->buf = buf;
+		memcpy(map->waiting_handshake_data.base, udp_data, udp_size);
+		map->waiting_handshake_data.len = udp_size;
 
 		//create Handshake packet
 		uv_buf_t handshake_buf = uv_buf_init(malloc(sizeof(EstablishPacket)), sizeof(EstablishPacket));
@@ -512,13 +461,16 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		ep->remote_addr = ip4h->daddr;
 		ep->remote_port = udph->dest;
 
-		LOG("R SED HS PKT: 0x%08x %05d\n", ep->remote_addr, ntohs(ep->remote_port));
-
+		LOG("SEND HS PKT: 0x%08x %05d\n", ep->remote_addr, ntohs(ep->remote_port));
 		//send Handshake packet
 		uv_udp_send(malloc(sizeof(uv_udp_send_t)), &map->local_sock, &handshake_buf, 1, &proxy_sockaddr, on_send);
 	}
 	else
+	{
+		uv_buf_t buf = uv_buf_init(malloc(udp_size), udp_size);
+		memcpy(buf.base, udp_data, udp_size);
 		uv_udp_send(malloc(sizeof(uv_udp_send_t)), &map->local_sock, &buf, 1, &proxy_sockaddr, on_send);
+	}
 
 	//time update
 	gettimeofday(&map->timeout, NULL);
