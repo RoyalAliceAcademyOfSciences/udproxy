@@ -42,7 +42,7 @@ typedef struct establishPacket
 {
 	uint magic_number;
 	uint remote_addr;
-	ushort remote_port;
+	u_int16_t remote_port;
 } EstablishPacket;
 
 typedef struct proxyPortMap
@@ -58,9 +58,9 @@ typedef struct proxyPortMap
 typedef struct clientAddr
 {
 	uint ipaddr_local;
-	ushort port_local;
+	u_int16_t port_local;
 	uint ipaddr_remote;
-	ushort port_remote;
+	u_int16_t port_remote;
 } ClientAddr;
 
 typedef struct clientPortMap
@@ -87,7 +87,7 @@ static uv_loop_t * loop = NULL;
 static uv_timer_t rm_timeout_timer;
 static uint udp_timeout_new = 30;
 static uint udp_timeout_established = 180;
-static ushort queue_num = 0;
+static u_int16_t queue_num = 0;
 
 static struct sockaddr proxy_sockaddr;
 
@@ -278,7 +278,7 @@ static void on_read_from_client(uv_udp_t* handle, ssize_t nread, const uv_buf_t*
 	return;
 }
 
-static char * proxy_get_udp_packet(char* data, size_t d_size, size_t * result_size, uint saddr, uint daddr, ushort sport, ushort dport)
+static char * proxy_get_udp_packet(char* data, size_t d_size, size_t * result_size, uint saddr, uint daddr, u_int16_t sport, u_int16_t dport)
 {
 	struct pseudo_udphdr
 	{
@@ -379,7 +379,7 @@ static void on_read_from_proxy(uv_udp_t* handle, ssize_t nread, const uv_buf_t* 
 		else
 		{
 			uint saddr = map->peer_addr.ipaddr_remote, daddr = map->peer_addr.ipaddr_local;
-			ushort sport = map->peer_addr.port_remote, dport = map->peer_addr.port_local;
+			u_int16_t sport = map->peer_addr.port_remote, dport = map->peer_addr.port_local;
 			size_t udp_packet_size;
 			char * udp_packet = proxy_get_udp_packet(buf->base, nread, &udp_packet_size, saddr, daddr, sport, dport);
 
