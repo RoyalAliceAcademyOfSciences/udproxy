@@ -598,7 +598,7 @@ void as_client()
 void print_help()
 {
 	printf("Usage:\n"
-			"udproxy [--verbose | -v] [--timeout | -t] [--clientmode | -c] [--queue num | -q]\n");
+			"udproxy --port|-p [--verbose|-v] [--timeout|-t] [--clientmode|-c --address|-a] [--queue num|-q]\n");
 }
 
 int main(int argc, char **argv)
