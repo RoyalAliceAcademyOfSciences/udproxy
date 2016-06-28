@@ -136,10 +136,10 @@ static void alloc_buffer(uv_handle_t* handle, size_t size, uv_buf_t* buf)
 
 static uv_buf_t copy_buffer(const uv_buf_t * buf, size_t suggested_size)
 {
-	uv_buf_t result = uv_buf_init(malloc(suggested_size), suggested_size);
+	uv_buf_t result;
 	result.base = malloc(suggested_size);
-	memcpy(result.base, buf->base, suggested_size);
 	result.len = suggested_size;
+	memcpy(result.base, buf->base, suggested_size);
 	return result;
 }
 
