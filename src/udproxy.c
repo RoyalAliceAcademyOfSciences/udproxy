@@ -95,17 +95,33 @@ static uv_udp_t udproxy_socket;
 static uv_poll_t nfqueue_handle;
 static int raw_sock;
 
-static void on_send(uv_udp_send_t* req, int status)
+static void udproxy_on_send(uv_udp_send_t* req, int status)
 {
 	if (enable_verbose && status)
 	{
 		ERROR("on_send() error!\n");
 	}
 
+	//free() memory ponits after send
 	int i;
-	for (i = 0; i < req->nbufs && i < 4; i++)
-		free(req->bufsml[i].base);
+	for (i = 0; i < req->nbufs; i++)
+		free(((char**)req->data)[i]);
+	free(req->data);
+
 	free(req);
+}
+
+static int udproxy_udp_send(uv_udp_t* handle, const uv_buf_t bufs[], unsigned int nbufs, const struct sockaddr* addr)
+{
+	uv_udp_send_t* req = malloc(sizeof(uv_udp_send_t));
+
+	//tell on_send(), which memory points need to free()
+	req->data = malloc(sizeof(char*) * nbufs);
+	int i;
+	for(i=0;i<nbufs;i++)
+		((char**)req->data)[i] = bufs[i].base;
+
+	return uv_udp_send(req, handle, bufs, nbufs, addr, udproxy_on_send);
 }
 
 static int client_find_by_addr(ClientPortMap * e, ClientAddr * peer_addr)
@@ -182,12 +198,15 @@ static void rm_timeout_client(uv_timer_t* handle)
 		if (elt->timeout.tv_sec - timestamp.tv_sec < 0)
 		{
 			LOG("connection timout\n");
+			uv_udp_recv_stop(&elt->local_sock);
+			uv_close((uv_handle_t*) &elt->local_sock, NULL);
+			if (elt->unhandshaked)
+				free(elt->waiting_handshake_data.base);
+
 			if (elt->prev)
 				DL_DELETE(client_map_head, elt);
 			else
 				client_map_head = NULL;
-			uv_udp_recv_stop(&elt->local_sock);
-			uv_close((uv_handle_t*) &elt->local_sock, NULL);
 			free(elt);
 		}
 	}
@@ -208,7 +227,7 @@ static void on_read_from_remote(uv_udp_t* handle, ssize_t nread, const uv_buf_t*
 	if (map)
 	{
 		uv_buf_t send_data = copy_buffer(buf, nread);
-		uv_udp_send(malloc(sizeof(uv_udp_send_t)), &udproxy_socket, &send_data, 1, &map->client_addr, on_send);
+		udproxy_udp_send(&udproxy_socket, &send_data, 1, &map->client_addr);
 
 		map->new = 0;
 		gettimeofday(&map->timeout, NULL);
@@ -259,12 +278,12 @@ static void on_read_from_client(uv_udp_t* handle, ssize_t nread, const uv_buf_t*
 
 		//tell the src: connection established.
 		uv_buf_t send_data = copy_buffer(buf, nread);
-		uv_udp_send(malloc(sizeof(uv_udp_send_t)), handle, &send_data, 1, src_addr, on_send);
+		udproxy_udp_send(handle, &send_data, 1, src_addr);
 	}
 	else
 	{
 		uv_buf_t send_data = copy_buffer(buf, nread);
-		uv_udp_send(malloc(sizeof(uv_udp_send_t)), &map->remote_sock, &send_data, 1, &map->remote_addr, on_send);
+		udproxy_udp_send(&map->remote_sock, &send_data, 1, &map->remote_addr);
 	}
 
 	//time update
@@ -374,7 +393,7 @@ static void on_read_from_proxy(uv_udp_t* handle, ssize_t nread, const uv_buf_t* 
 		{
 			map->unhandshaked = 0;
 			LOG("RECV HS PKT: 0x%08x %05d\n", ep->remote_addr, ntohs(ep->remote_port));
-			uv_udp_send(malloc(sizeof(uv_udp_send_t)), &map->local_sock, &map->waiting_handshake_data, 1, &proxy_sockaddr, NULL);
+			udproxy_udp_send(&map->local_sock, &map->waiting_handshake_data, 1, &proxy_sockaddr);
 		}
 		else
 		{
@@ -463,13 +482,13 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 
 		LOG("SEND HS PKT: 0x%08x %05d\n", ep->remote_addr, ntohs(ep->remote_port));
 		//send Handshake packet
-		uv_udp_send(malloc(sizeof(uv_udp_send_t)), &map->local_sock, &handshake_buf, 1, &proxy_sockaddr, on_send);
+		udproxy_udp_send(&map->local_sock, &handshake_buf, 1, &proxy_sockaddr);
 	}
 	else
 	{
 		uv_buf_t buf = uv_buf_init(malloc(udp_size), udp_size);
 		memcpy(buf.base, udp_data, udp_size);
-		uv_udp_send(malloc(sizeof(uv_udp_send_t)), &map->local_sock, &buf, 1, &proxy_sockaddr, on_send);
+		udproxy_udp_send(&map->local_sock, &buf, 1, &proxy_sockaddr);
 	}
 
 	//time update
