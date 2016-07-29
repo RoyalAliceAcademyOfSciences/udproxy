@@ -617,7 +617,7 @@ void as_client()
 void print_help()
 {
 	printf("Usage:\n"
-			"udproxy --port|-p [--verbose|-v] [--timeout|-t] [--clientmode|-c --address|-a] [--queue num|-q]\n");
+			"udproxy --port|-p [--verbose|-v] [--clientmode|-c --address|-a] [--queue num|-q]\n");
 }
 
 int main(int argc, char **argv)
@@ -641,20 +641,6 @@ int main(int argc, char **argv)
 		else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--clientmode") == 0)
 		{
 			enable_isclient = 1;
-		}
-		else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--timeout") == 0)
-		{
-			if (i + 1 < argc)
-			{
-				udp_timeout_new = atoi(argv[i + 1]);
-				i++;
-			}
-			else
-			{
-				ERROR("Invalid arguments.\n");
-				print_help();
-				exit(0);
-			}
 		}
 		else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--address") == 0)
 		{
