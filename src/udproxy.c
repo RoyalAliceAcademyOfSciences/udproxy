@@ -75,8 +75,19 @@ typedef struct clientPortMap
 	struct clientPortMap *next, *prev;
 } ClientPortMap;
 
+typedef struct clientDnatMap
+{
+	uint mask;
+	uint subnet;
+	u_int16_t port;
+	uint ipaddr_nat_dest;
+	u_int16_t port_nat_dest;
+	struct clientDnatMap *next, *prev;
+} ClientDnatMap;
+
 static ProxyPortMap * proxy_map_head = NULL;
 static ClientPortMap * client_map_head = NULL;
+static ClientDnatMap * client_dnatmap_head = NULL;
 
 static int enable_verbose = 0;
 static int enable_isclient = 0;
@@ -124,6 +135,11 @@ static int udproxy_udp_send(uv_udp_t* handle, const uv_buf_t bufs[], unsigned in
 	return uv_udp_send(req, handle, bufs, nbufs, addr, udproxy_on_send);
 }
 
+/*
+ * ==========================
+ * find port map
+ * ==========================
+ */
 static int client_find_by_addr(ClientPortMap * e, ClientAddr * peer_addr)
 {
 	return memcmp(&e->peer_addr, peer_addr, sizeof(ClientAddr));
@@ -142,6 +158,19 @@ static int proxy_find_by_addr(ProxyPortMap * e, const struct sockaddr * client_a
 static int proxy_find_by_sock(ProxyPortMap * e, uv_udp_t * remote_sock)
 {
 	return &e->remote_sock - remote_sock;
+}
+/*
+ * ==========================
+ * find port map
+ * ==========================
+ */
+
+// match ip in dnat map
+static int client_dnat_find_by_addr(ClientDnatMap *e, const struct sockaddr_in * naddr)
+{
+	if((e->subnet == (e->mask & naddr->sin_addr.s_addr)) && (e->port == naddr->sin_port || e->port == 0))
+		return 0;
+	return -1;
 }
 
 static void alloc_buffer(uv_handle_t* handle, size_t size, uv_buf_t* buf)
@@ -480,6 +509,24 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		ep->remote_addr = ip4h->daddr;
 		ep->remote_port = udph->dest;
 
+		//DNAT match search
+		if(client_dnatmap_head)
+		{
+			struct sockaddr_in naddr;
+			naddr.sin_addr.s_addr = ip4h->daddr;
+			naddr.sin_port = udph->dest;
+			ClientDnatMap * dnat = NULL;
+			DL_SEARCH(client_dnatmap_head, dnat, &naddr, client_dnat_find_by_addr)
+					;
+
+			//replace IP address and port, if matched
+			if(dnat)
+			{
+				ep->remote_addr = dnat->ipaddr_nat_dest;
+				ep->remote_port = dnat->port_nat_dest;
+			}
+		}
+
 		LOG("SEND HS PKT: 0x%08x %05d\n", ep->remote_addr, ntohs(ep->remote_port));
 		//send Handshake packet
 		udproxy_udp_send(&map->local_sock, &handshake_buf, 1, &proxy_sockaddr);
@@ -638,10 +685,12 @@ int main(int argc, char **argv)
 		{
 			enable_verbose = 1;
 		}
+		//if enable "-c" startup as a client, else as a proxy server
 		else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--clientmode") == 0)
 		{
 			enable_isclient = 1;
 		}
+		//set proxy server address
 		else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--address") == 0)
 		{
 			if (i + 1 < argc)
@@ -656,6 +705,7 @@ int main(int argc, char **argv)
 				exit(0);
 			}
 		}
+		//set proxy server port
 		else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0)
 		{
 			if (i + 1 < argc)
@@ -670,11 +720,62 @@ int main(int argc, char **argv)
 				exit(0);
 			}
 		}
+		//set nfqueue number
 		else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--queue") == 0)
 		{
 			if (i + 1 < argc)
 			{
 				queue_num = atoi(argv[i + 1]);
+				i++;
+			}
+			else
+			{
+				ERROR("Invalid arguments.\n");
+				print_help();
+				exit(0);
+			}
+		}
+		//set DNAT items
+		else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--dnat") == 0)
+		{
+			if (i + 1 < argc)
+			{
+				uint subnet ,nat_dest;
+				// DNAT from ip address part
+				uint subnet_part[4];
+				// DNAT to ip address part
+				uint nat_dest_part[4];
+				// DNAT from ip address subnet CIDR
+				uint subnet_cidr;
+				uint subnet_port, nat_dest_port;
+
+				//TODO add DNAT items to the map client_dnatmap_head;
+				int ret = sscanf(argv[i + 1],
+						//0.0.0.0/0:53-8.8.8.8:53
+						"%d.%d.%d.%d/%d:%d-%d.%d.%d.%d:%d",
+						&subnet_part[0], &subnet_part[1], &subnet_part[2], &subnet_part[3],
+						&subnet_cidr,
+						&subnet_port,
+						&nat_dest_part[0], &nat_dest_part[1], &nat_dest_part[2], &nat_dest_part[3],
+						&nat_dest_port);
+				if(ret==11)
+				{
+					ClientDnatMap * dnat = malloc(sizeof(ClientDnatMap));
+
+					nat_dest = nat_dest_part[0] | nat_dest_part[1] << 8 | nat_dest_part[2] << 16 | nat_dest_part[3] << 24;
+					dnat->ipaddr_nat_dest = nat_dest;
+
+					dnat->mask = (0xFFFFFFFFUL << (32 - subnet_cidr)) & 0xFFFFFFFFUL;
+					subnet = subnet_part[0] | subnet_part[1] << 8 | subnet_part[2] << 16 | subnet_part[3] << 24;
+					dnat->subnet = subnet & dnat->mask;
+
+					dnat->port = htons(subnet_port);
+					dnat->port_nat_dest = htons(nat_dest_port);
+
+					DL_APPEND(client_dnatmap_head, dnat);
+				}
+//				else
+
 				i++;
 			}
 			else
