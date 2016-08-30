@@ -29,7 +29,10 @@
 
 #include "utlist.h"
 
+// magic number
 #define UDPROXY_MN	htonl(0x20160603)
+// max length of fastopen payload
+#define UDPROXY_FO_MAX	1350
 
 #ifdef DEBUG
 #define LOG(x, ...) printf(x, ##__VA_ARGS__)
@@ -43,6 +46,8 @@ typedef struct establishPacket
 	uint magic_number;
 	uint remote_addr;
 	u_int16_t remote_port;
+	u_char fastopen;
+	u_char data[];
 } EstablishPacket;
 
 typedef struct proxyPortMap
@@ -51,6 +56,7 @@ typedef struct proxyPortMap
 	struct sockaddr remote_addr;
 	uv_udp_t remote_sock;
 	u_char new;
+	u_char unhandshaked;
 	struct timeval timeout;
 	struct proxyPortMap *next, *prev;
 } ProxyPortMap;
@@ -229,7 +235,7 @@ static void rm_timeout_client(uv_timer_t* handle)
 			LOG("connection timout\n");
 			uv_udp_recv_stop(&elt->local_sock);
 			uv_close((uv_handle_t*) &elt->local_sock, NULL);
-			if (elt->unhandshaked)
+			if (elt->waiting_handshake_data.len > 0)
 				free(elt->waiting_handshake_data.base);
 
 			if (elt->prev)
@@ -273,6 +279,7 @@ static void on_read_from_client(uv_udp_t* handle, ssize_t nread, const uv_buf_t*
 		free(buf->base);
 		return;
 	}
+	EstablishPacket * ep = (EstablishPacket*) buf->base;
 
 	ProxyPortMap * map;
 	DL_SEARCH(proxy_map_head, map, src_addr, proxy_find_by_addr)
@@ -280,8 +287,7 @@ static void on_read_from_client(uv_udp_t* handle, ssize_t nread, const uv_buf_t*
 
 	if (!map)
 	{
-		EstablishPacket * ep = (EstablishPacket*) buf->base;
-		if (nread != sizeof(EstablishPacket) || ep->magic_number != UDPROXY_MN)
+		if (ep->magic_number != UDPROXY_MN || nread < sizeof(EstablishPacket))
 		{
 			ERROR("new connection packet error.\n");
 			free(buf->base);
@@ -293,6 +299,7 @@ static void on_read_from_client(uv_udp_t* handle, ssize_t nread, const uv_buf_t*
 		DL_APPEND(proxy_map_head, map);
 
 		map->new = 1;
+		map->unhandshaked = 1;
 
 		memcpy(&map->client_addr, src_addr, sizeof(struct sockaddr));
 
@@ -303,16 +310,32 @@ static void on_read_from_client(uv_udp_t* handle, ssize_t nread, const uv_buf_t*
 
 		uv_udp_init(loop, &map->remote_sock);
 		uv_udp_recv_start(&map->remote_sock, alloc_buffer, on_read_from_remote);
-		LOG("new connection established.\n");
+		LOG("new connection open.\n");
+	}
 
-		//tell the src: connection established.
+	// no more handshake packet, connection established.
+	if(map->unhandshaked == 0 || ep->magic_number != UDPROXY_MN)
+	{
+		map->unhandshaked = 0;
 		uv_buf_t send_data = copy_buffer(buf, nread);
-		udproxy_udp_send(handle, &send_data, 1, src_addr);
+		udproxy_udp_send(&map->remote_sock, &send_data, 1, &map->remote_addr);
 	}
 	else
 	{
-		uv_buf_t send_data = copy_buffer(buf, nread);
-		udproxy_udp_send(&map->remote_sock, &send_data, 1, &map->remote_addr);
+		//tell the client: connection established.
+		uv_buf_t handshake_report = copy_buffer(buf, sizeof(EstablishPacket));
+		udproxy_udp_send(handle, &handshake_report, 1, src_addr);
+
+		//is fastopen packet, send the payload data
+		if(nread > sizeof(EstablishPacket))
+		{
+			uint ep_data_len = nread - sizeof(EstablishPacket);
+			uv_buf_t send_data;
+			send_data.base = malloc(ep_data_len);
+			send_data.len = ep_data_len;
+			memcpy(send_data.base, ep->data, ep_data_len);
+			udproxy_udp_send(&map->remote_sock, &send_data, 1, &map->remote_addr);
+		}
 	}
 
 	//time update
@@ -416,13 +439,20 @@ static void on_read_from_proxy(uv_udp_t* handle, ssize_t nread, const uv_buf_t* 
 
 	if (map)
 	{
-		EstablishPacket * ep = (EstablishPacket*) buf->base;
 		//is Handshake packet, timeout do NOT need update
-		if (map->unhandshaked && nread == sizeof(EstablishPacket) && ep->magic_number == UDPROXY_MN)
+		if (map->unhandshaked && nread == sizeof(EstablishPacket) && ((EstablishPacket*)buf->base)->magic_number == UDPROXY_MN)
 		{
+			LOG("RECV HS PKT: 0x%08x %05d\n",
+					((struct sockaddr_in*) addr)->sin_addr.s_addr,
+					ntohs(((struct sockaddr_in*) addr)->sin_port)
+					);
 			map->unhandshaked = 0;
-			LOG("RECV HS PKT: 0x%08x %05d\n", ep->remote_addr, ntohs(ep->remote_port));
-			udproxy_udp_send(&map->local_sock, &map->waiting_handshake_data, 1, &proxy_sockaddr);
+			//prepare for non-fastopen Handshake packet
+			if(map->waiting_handshake_data.len > 0)
+			{
+				udproxy_udp_send(&map->local_sock, &map->waiting_handshake_data, 1, &proxy_sockaddr);
+				map->waiting_handshake_data.len = 0;
+			}
 		}
 		else
 		{
@@ -446,6 +476,16 @@ static void on_read_from_proxy(uv_udp_t* handle, ssize_t nread, const uv_buf_t* 
 			map->new = 0;
 			gettimeofday(&map->timeout, NULL);
 			map->timeout.tv_sec += udp_timeout_established;
+		}
+
+		//set handshaked mark and log it
+		if (map->unhandshaked)
+		{
+			LOG("LOST HS PKT: 0x%08x %05d\n",
+					((struct sockaddr_in*) addr)->sin_addr.s_addr,
+					ntohs(((struct sockaddr_in*) addr)->sin_port)
+					);
+			map->unhandshaked = 0;
 		}
 	}
 
@@ -489,27 +529,45 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		map->new = 1;
 		map->unhandshaked = 1;
 		map->peer_addr = peer_addr;
+		map->waiting_handshake_data.len = 0;
 
 		uv_udp_init(loop, &map->local_sock);
 		uv_udp_recv_start(&map->local_sock, alloc_buffer, on_read_from_proxy);
-
-		map->waiting_handshake_data.base = malloc(4096);
 	}
 
 	//save data to waiting buffer and send Handshake packet
 	if (map->unhandshaked)
 	{
-		memcpy(map->waiting_handshake_data.base, udp_data, udp_size);
-		map->waiting_handshake_data.len = udp_size;
+		uv_buf_t handshake_buf;
+		EstablishPacket * ep;
 
-		//create Handshake packet
-		uv_buf_t handshake_buf = uv_buf_init(malloc(sizeof(EstablishPacket)), sizeof(EstablishPacket));
-		EstablishPacket * ep = (EstablishPacket*) handshake_buf.base;
+		// non-fastopen
+		if(sizeof(EstablishPacket)+udp_size > UDPROXY_FO_MAX)
+		{
+			// create non-fastopen Handshake packet
+			handshake_buf = uv_buf_init(malloc(sizeof(EstablishPacket)), sizeof(EstablishPacket));
+			ep = (EstablishPacket*) handshake_buf.base;
+
+			if(map->waiting_handshake_data.len > 0)
+				free(map->waiting_handshake_data.base);
+			map->waiting_handshake_data.len = udp_size;
+			map->waiting_handshake_data.base = malloc(udp_size);
+			// copy non-fastopen data packet to waiting send field
+			memcpy(map->waiting_handshake_data.base, udp_data, udp_size);
+		}
+		// fastopen
+		else
+		{
+			handshake_buf = uv_buf_init(malloc(sizeof(EstablishPacket)+udp_size), sizeof(EstablishPacket)+udp_size);
+			ep = (EstablishPacket*) handshake_buf.base;
+			memcpy(ep->data, udp_data, udp_size);
+		}
+
 		ep->magic_number = UDPROXY_MN;
 		ep->remote_addr = ip4h->daddr;
 		ep->remote_port = udph->dest;
 
-		//DNAT match search
+		// DNAT match search
 		if(client_dnatmap_head)
 		{
 			struct sockaddr_in naddr;
@@ -519,7 +577,7 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 			DL_SEARCH(client_dnatmap_head, dnat, &naddr, client_dnat_find_by_addr)
 					;
 
-			//replace IP address and port, if matched
+			// replace IP address and port, if matched
 			if(dnat)
 			{
 				ep->remote_addr = dnat->ipaddr_nat_dest;
@@ -528,7 +586,7 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		}
 
 		LOG("SEND HS PKT: 0x%08x %05d\n", ep->remote_addr, ntohs(ep->remote_port));
-		//send Handshake packet
+		// send Handshake packet
 		udproxy_udp_send(&map->local_sock, &handshake_buf, 1, &proxy_sockaddr);
 	}
 	else
@@ -538,7 +596,7 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		udproxy_udp_send(&map->local_sock, &buf, 1, &proxy_sockaddr);
 	}
 
-	//time update
+	// time update
 	gettimeofday(&map->timeout, NULL);
 	if (map->new)
 		map->timeout.tv_sec += udp_timeout_new;
@@ -749,7 +807,7 @@ int main(int argc, char **argv)
 				uint subnet_cidr;
 				uint subnet_port, nat_dest_port;
 
-				//TODO add DNAT items to the map client_dnatmap_head;
+				// add DNAT items to the map client_dnatmap_head;
 				int ret = sscanf(argv[i + 1],
 						//0.0.0.0/0:53-8.8.8.8:53
 						"%d.%d.%d.%d/%d:%d-%d.%d.%d.%d:%d",
