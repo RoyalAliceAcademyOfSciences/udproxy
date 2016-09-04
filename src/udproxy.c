@@ -30,9 +30,11 @@
 #include "utlist.h"
 
 // magic number
-#define UDPROXY_MN	htonl(0x20160603)
+#define UDPROXY_MN		htonl(0x20160603)
 // max length of fastopen payload
-#define UDPROXY_FO_MAX	1350
+#define UDPROXY_FO_MAX		1350
+// handshake timeout in sec
+#define UDPROXY_PING_MAX 	4
 
 #ifdef DEBUG
 #define LOG(x, ...) printf(x, ##__VA_ARGS__)
@@ -46,7 +48,6 @@ typedef struct establishPacket
 	uint magic_number;
 	uint remote_addr;
 	u_int16_t remote_port;
-	u_char fastopen;
 	u_char data[];
 } EstablishPacket;
 
@@ -76,6 +77,7 @@ typedef struct clientPortMap
 	uv_udp_t local_sock;
 	u_char new;
 	u_char unhandshaked;
+	struct timeval time_handshake;
 	uv_buf_t waiting_handshake_data;
 	struct timeval timeout;
 	struct clientPortMap *next, *prev;
@@ -313,29 +315,36 @@ static void on_read_from_client(uv_udp_t* handle, ssize_t nread, const uv_buf_t*
 		LOG("new connection open.\n");
 	}
 
-	// no more handshake packet, connection established.
-	if(map->unhandshaked == 0 || ep->magic_number != UDPROXY_MN)
+	if(map->unhandshaked)
 	{
-		map->unhandshaked = 0;
-		uv_buf_t send_data = copy_buffer(buf, nread);
-		udproxy_udp_send(&map->remote_sock, &send_data, 1, &map->remote_addr);
+		if(ep->magic_number == UDPROXY_MN && nread >= sizeof(EstablishPacket))
+		{
+			//is fastopen packet, send the payload data
+			if(nread > sizeof(EstablishPacket))
+			{
+				uint ep_data_len = nread - sizeof(EstablishPacket);
+				uv_buf_t send_data;
+				send_data.base = malloc(ep_data_len);
+				send_data.len = ep_data_len;
+				memcpy(send_data.base, ep->data, ep_data_len);
+				udproxy_udp_send(&map->remote_sock, &send_data, 1, &map->remote_addr);
+			}
+			//tell the client: connection established.
+			uv_buf_t handshake_report = copy_buffer(buf, sizeof(EstablishPacket));
+			udproxy_udp_send(handle, &handshake_report, 1, src_addr);
+		}
+		// no more handshake packet, connection established.
+		else
+		{
+			map->unhandshaked = 0;
+			uv_buf_t send_data = copy_buffer(buf, nread);
+			udproxy_udp_send(&map->remote_sock, &send_data, 1, &map->remote_addr);
+		}
 	}
 	else
 	{
-		//tell the client: connection established.
-		uv_buf_t handshake_report = copy_buffer(buf, sizeof(EstablishPacket));
-		udproxy_udp_send(handle, &handshake_report, 1, src_addr);
-
-		//is fastopen packet, send the payload data
-		if(nread > sizeof(EstablishPacket))
-		{
-			uint ep_data_len = nread - sizeof(EstablishPacket);
-			uv_buf_t send_data;
-			send_data.base = malloc(ep_data_len);
-			send_data.len = ep_data_len;
-			memcpy(send_data.base, ep->data, ep_data_len);
-			udproxy_udp_send(&map->remote_sock, &send_data, 1, &map->remote_addr);
-		}
+		uv_buf_t send_data = copy_buffer(buf, nread);
+		udproxy_udp_send(&map->remote_sock, &send_data, 1, &map->remote_addr);
 	}
 
 	//time update
@@ -439,54 +448,48 @@ static void on_read_from_proxy(uv_udp_t* handle, ssize_t nread, const uv_buf_t* 
 
 	if (map)
 	{
-		//is Handshake packet, timeout do NOT need update
-		if (map->unhandshaked && nread == sizeof(EstablishPacket) && ((EstablishPacket*)buf->base)->magic_number == UDPROXY_MN)
-		{
-			LOG("RECV HS PKT: 0x%08x %05d\n",
-					((struct sockaddr_in*) addr)->sin_addr.s_addr,
-					ntohs(((struct sockaddr_in*) addr)->sin_port)
-					);
-			map->unhandshaked = 0;
-			//prepare for non-fastopen Handshake packet
-			if(map->waiting_handshake_data.len > 0)
-			{
-				udproxy_udp_send(&map->local_sock, &map->waiting_handshake_data, 1, &proxy_sockaddr);
-				map->waiting_handshake_data.len = 0;
-			}
-		}
-		else
-		{
-			uint saddr = map->peer_addr.ipaddr_remote, daddr = map->peer_addr.ipaddr_local;
-			u_int16_t sport = map->peer_addr.port_remote, dport = map->peer_addr.port_local;
-			size_t udp_packet_size;
-			char * udp_packet = proxy_get_udp_packet(buf->base, nread, &udp_packet_size, saddr, daddr, sport, dport);
-
-			struct sockaddr_in daddr_in;
-			bzero(&daddr_in, sizeof(daddr_in));
-			daddr_in.sin_family = AF_INET;
-			daddr_in.sin_addr.s_addr = daddr;
-
-			LOG("RAW SOCK SED: F[0x%08x %05d] T[0x%08x %05d]\n", saddr, ntohs(sport), daddr, ntohs(dport));
-			if (sendto(raw_sock, udp_packet, udp_packet_size, 0, (struct sockaddr *) &daddr_in, (socklen_t) sizeof(daddr_in)) < 0)
-				ERROR("raw socket sendto()\n");
-
-			free(udp_packet);
-
-			//update time
-			map->new = 0;
-			gettimeofday(&map->timeout, NULL);
-			map->timeout.tv_sec += udp_timeout_established;
-		}
-
-		//set handshaked mark and log it
 		if (map->unhandshaked)
 		{
-			LOG("LOST HS PKT: 0x%08x %05d\n",
-					((struct sockaddr_in*) addr)->sin_addr.s_addr,
-					ntohs(((struct sockaddr_in*) addr)->sin_port)
-					);
 			map->unhandshaked = 0;
+			EstablishPacket * ep = (EstablishPacket*)buf->base;
+			//is Handshake report packet
+			if (nread == sizeof(EstablishPacket) && ep->magic_number == UDPROXY_MN)
+			{
+				LOG("RECV HS PKT: 0x%08x %05d\n", ep->remote_addr,ntohs(ep->remote_port));
+
+				//prepare for non-fastopen Handshake packet
+				if(map->waiting_handshake_data.len > 0)
+				{
+					udproxy_udp_send(&map->local_sock, &map->waiting_handshake_data, 1, &proxy_sockaddr);
+					map->waiting_handshake_data.len = 0;
+				}
+
+				free(buf->base);
+				//timeout do NOT need update
+				return;
+			}
 		}
+
+		uint saddr = map->peer_addr.ipaddr_remote, daddr = map->peer_addr.ipaddr_local;
+		u_int16_t sport = map->peer_addr.port_remote, dport = map->peer_addr.port_local;
+		size_t udp_packet_size;
+		char * udp_packet = proxy_get_udp_packet(buf->base, nread, &udp_packet_size, saddr, daddr, sport, dport);
+
+		struct sockaddr_in daddr_in;
+		bzero(&daddr_in, sizeof(daddr_in));
+		daddr_in.sin_family = AF_INET;
+		daddr_in.sin_addr.s_addr = daddr;
+
+		LOG("RAW SOCK SED: F[0x%08x %05d] T[0x%08x %05d]\n", saddr, ntohs(sport), daddr, ntohs(dport));
+		if (sendto(raw_sock, udp_packet, udp_packet_size, 0, (struct sockaddr *) &daddr_in, (socklen_t) sizeof(daddr_in)) < 0)
+			ERROR("raw socket sendto()\n");
+
+		free(udp_packet);
+
+		//update time
+		map->new = 0;
+		gettimeofday(&map->timeout, NULL);
+		map->timeout.tv_sec += udp_timeout_established;
 	}
 
 	free(buf->base);
@@ -528,6 +531,7 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 
 		map->new = 1;
 		map->unhandshaked = 1;
+		map->time_handshake.tv_sec = 0;
 		map->peer_addr = peer_addr;
 		map->waiting_handshake_data.len = 0;
 
@@ -535,66 +539,77 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		uv_udp_recv_start(&map->local_sock, alloc_buffer, on_read_from_proxy);
 	}
 
-	//save data to waiting buffer and send Handshake packet
+	uv_buf_t buf;
 	if (map->unhandshaked)
 	{
-		uv_buf_t handshake_buf;
-		EstablishPacket * ep;
-
-		// non-fastopen
-		if(sizeof(EstablishPacket)+udp_size > UDPROXY_FO_MAX)
+		struct timeval now;
+		gettimeofday(&now, NULL);
+		if(now.tv_sec - map->time_handshake.tv_sec >= UDPROXY_PING_MAX)
 		{
-			// create non-fastopen Handshake packet
-			handshake_buf = uv_buf_init(malloc(sizeof(EstablishPacket)), sizeof(EstablishPacket));
-			ep = (EstablishPacket*) handshake_buf.base;
+			EstablishPacket * ep;
 
-			if(map->waiting_handshake_data.len > 0)
-				free(map->waiting_handshake_data.base);
-			map->waiting_handshake_data.len = udp_size;
-			map->waiting_handshake_data.base = malloc(udp_size);
-			// copy non-fastopen data packet to waiting send field
-			memcpy(map->waiting_handshake_data.base, udp_data, udp_size);
+			// non-fastopen, save data to waiting buffer
+			if(sizeof(EstablishPacket)+udp_size > UDPROXY_FO_MAX)
+			{
+				// create non-fastopen Handshake packet
+				buf = uv_buf_init(malloc(sizeof(EstablishPacket)), sizeof(EstablishPacket));
+				ep = (EstablishPacket*) buf.base;
+
+				if(map->waiting_handshake_data.len > 0)
+					free(map->waiting_handshake_data.base);
+				map->waiting_handshake_data.len = udp_size;
+				map->waiting_handshake_data.base = malloc(udp_size);
+				// copy non-fastopen data packet to waiting send field
+				memcpy(map->waiting_handshake_data.base, udp_data, udp_size);
+			}
+			// fastopen
+			else
+			{
+				buf = uv_buf_init(malloc(sizeof(EstablishPacket)+udp_size), sizeof(EstablishPacket)+udp_size);
+				ep = (EstablishPacket*) buf.base;
+				memcpy(ep->data, udp_data, udp_size);
+			}
+
+			ep->magic_number = UDPROXY_MN;
+			ep->remote_addr = ip4h->daddr;
+			ep->remote_port = udph->dest;
+
+			// DNAT match search
+			if(client_dnatmap_head)
+			{
+				struct sockaddr_in naddr;
+				naddr.sin_addr.s_addr = ip4h->daddr;
+				naddr.sin_port = udph->dest;
+				ClientDnatMap * dnat = NULL;
+				DL_SEARCH(client_dnatmap_head, dnat, &naddr, client_dnat_find_by_addr)
+						;
+
+				// replace IP address and port, if matched
+				if(dnat)
+				{
+					ep->remote_addr = dnat->ipaddr_nat_dest;
+					ep->remote_port = dnat->port_nat_dest;
+				}
+			}
+
+			// log Handshake packet
+			LOG("SEND HS PKT: 0x%08x %05d\n", ep->remote_addr, ntohs(ep->remote_port));
+			// update handshake time
+			map->time_handshake = now;
 		}
-		// fastopen
 		else
 		{
-			handshake_buf = uv_buf_init(malloc(sizeof(EstablishPacket)+udp_size), sizeof(EstablishPacket)+udp_size);
-			ep = (EstablishPacket*) handshake_buf.base;
-			memcpy(ep->data, udp_data, udp_size);
+			buf = uv_buf_init(malloc(udp_size), udp_size);
+			memcpy(buf.base, udp_data, udp_size);
 		}
-
-		ep->magic_number = UDPROXY_MN;
-		ep->remote_addr = ip4h->daddr;
-		ep->remote_port = udph->dest;
-
-		// DNAT match search
-		if(client_dnatmap_head)
-		{
-			struct sockaddr_in naddr;
-			naddr.sin_addr.s_addr = ip4h->daddr;
-			naddr.sin_port = udph->dest;
-			ClientDnatMap * dnat = NULL;
-			DL_SEARCH(client_dnatmap_head, dnat, &naddr, client_dnat_find_by_addr)
-					;
-
-			// replace IP address and port, if matched
-			if(dnat)
-			{
-				ep->remote_addr = dnat->ipaddr_nat_dest;
-				ep->remote_port = dnat->port_nat_dest;
-			}
-		}
-
-		LOG("SEND HS PKT: 0x%08x %05d\n", ep->remote_addr, ntohs(ep->remote_port));
-		// send Handshake packet
-		udproxy_udp_send(&map->local_sock, &handshake_buf, 1, &proxy_sockaddr);
 	}
 	else
 	{
-		uv_buf_t buf = uv_buf_init(malloc(udp_size), udp_size);
+		buf = uv_buf_init(malloc(udp_size), udp_size);
 		memcpy(buf.base, udp_data, udp_size);
-		udproxy_udp_send(&map->local_sock, &buf, 1, &proxy_sockaddr);
 	}
+	// send handshake packet or raw data
+	udproxy_udp_send(&map->local_sock, &buf, 1, &proxy_sockaddr);
 
 	// time update
 	gettimeofday(&map->timeout, NULL);
