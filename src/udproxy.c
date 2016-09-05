@@ -176,6 +176,10 @@ static int proxy_find_by_sock(ProxyPortMap * e, uv_udp_t * remote_sock)
 // match ip in dnat map
 static int client_dnat_find_by_addr(ClientDnatMap *e, const struct sockaddr_in * naddr)
 {
+	//for Debug
+//	LOG("SUBNET:0x%08x MATCPRT:%05d\n", e->subnet, e->port);
+//	LOG("MASKIP:0x%08x DESTPRT:%05d\n", e->mask & naddr->sin_addr.s_addr, naddr->sin_port);
+//	LOG("SNMASK:0x%08x DESTIP:0x%08x\n", e->mask, naddr->sin_addr.s_addr);
 	if((e->subnet == (e->mask & naddr->sin_addr.s_addr)) && (e->port == naddr->sin_port || e->port == 0))
 		return 0;
 	return -1;
@@ -291,7 +295,7 @@ static void on_read_from_client(uv_udp_t* handle, ssize_t nread, const uv_buf_t*
 	{
 		if (ep->magic_number != UDPROXY_MN || nread < sizeof(EstablishPacket))
 		{
-			ERROR("new connection packet error.\n");
+			ERROR("ERR: NON-HS PKT\n");
 			free(buf->base);
 			return;
 		}
@@ -312,7 +316,7 @@ static void on_read_from_client(uv_udp_t* handle, ssize_t nread, const uv_buf_t*
 
 		uv_udp_init(loop, &map->remote_sock);
 		uv_udp_recv_start(&map->remote_sock, alloc_buffer, on_read_from_remote);
-		LOG("new connection open.\n");
+		LOG("NEW RECV HS PKT: 0x%08x %05d  PLD LEN:%04d\n", ep->remote_addr, ntohs(ep->remote_port));
 	}
 
 	if(map->unhandshaked)
@@ -455,7 +459,7 @@ static void on_read_from_proxy(uv_udp_t* handle, ssize_t nread, const uv_buf_t* 
 			//is Handshake report packet
 			if (nread == sizeof(EstablishPacket) && ep->magic_number == UDPROXY_MN)
 			{
-				LOG("RECV HS PKT: 0x%08x %05d\n", ep->remote_addr,ntohs(ep->remote_port));
+				LOG("RECV HS PKT: 0x%08x %05d\n", ep->remote_addr, ntohs(ep->remote_port));
 
 				//prepare for non-fastopen Handshake packet
 				if(map->waiting_handshake_data.len > 0)
@@ -838,7 +842,8 @@ int main(int argc, char **argv)
 					nat_dest = nat_dest_part[0] | nat_dest_part[1] << 8 | nat_dest_part[2] << 16 | nat_dest_part[3] << 24;
 					dnat->ipaddr_nat_dest = nat_dest;
 
-					dnat->mask = (0xFFFFFFFFUL << (32 - subnet_cidr)) & 0xFFFFFFFFUL;
+					long long int pre_mask = 0xFFFFFFFF;
+					dnat->mask = pre_mask << (32 - subnet_cidr);
 					subnet = subnet_part[0] | subnet_part[1] << 8 | subnet_part[2] << 16 | subnet_part[3] << 24;
 					dnat->subnet = subnet & dnat->mask;
 
