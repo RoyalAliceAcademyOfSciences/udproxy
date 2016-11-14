@@ -120,6 +120,17 @@ static void rm_timeout_client(uv_timer_t* handle)
 	}
 }
 
+/*
+ * char* data		in	payload data
+ * size_t d_size	in	payload data size
+ * size_t * result_size	out	udp packet sizke
+ * uint saddr		in	udp packet saddr
+ * uint daddr		in	udp packet daddr
+ * u_int16_t sport	in	udp packet sport
+ * u_int16_t dport	in	udp packet dport
+ *
+ * char * return	out	udp packet
+ */
 static char * proxy_get_udp_packet(char* data, size_t d_size, size_t * result_size, uint saddr, uint daddr, u_int16_t sport, u_int16_t dport)
 {
 	struct pseudo_udphdr
