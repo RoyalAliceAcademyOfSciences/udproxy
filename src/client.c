@@ -6,11 +6,7 @@
  */
 
 #include "common.h"
-
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netinet/ip.h>
-#include <netinet/udp.h>
+#include "netpacketkits.h"
 
 #include <linux/netfilter.h>            /* for NF_ACCEPT */
 #include <libnetfilter_queue/libnetfilter_queue.h>
@@ -27,7 +23,6 @@ static uv_loop_t * loop = NULL;
 static uv_timer_t rm_timeout_timer;
 
 static u_int16_t queue_num = 0;
-static int enable_addzero = 0;
 static int raw_sock;
 static uv_poll_t nfqueue_handle;
 static struct sockaddr proxy_sockaddr;
@@ -47,6 +42,7 @@ typedef struct clientPortMap
 	uv_udp_t local_sock;
 	u_char new;
 	u_char unhandshaked;
+	u_char protocol;
 	struct timeval time_handshake;
 	uv_buf_t waiting_handshake_data;
 	struct timeval timeout;
@@ -120,93 +116,6 @@ static void rm_timeout_client(uv_timer_t* handle)
 	}
 }
 
-/*
- * char* data		in	payload data
- * size_t d_size	in	payload data size
- * size_t * result_size	out	udp packet sizke
- * uint saddr		in	udp packet saddr
- * uint daddr		in	udp packet daddr
- * u_int16_t sport	in	udp packet sport
- * u_int16_t dport	in	udp packet dport
- *
- * char * return	out	udp packet
- */
-static char * proxy_get_udp_packet(char* data, size_t d_size, size_t * result_size, uint saddr, uint daddr, u_int16_t sport, u_int16_t dport)
-{
-	struct pseudo_udphdr
-	{
-		u_int32_t source;
-		u_int32_t dest;
-		u_int8_t zero; //reserved, check http://www.rhyshaden.com/udp.htm
-		u_int8_t protocol;
-		u_int16_t udp_length;
-	};
-
-	*result_size = d_size + sizeof(struct iphdr) + sizeof(struct udphdr);
-
-	//set all header pointer
-	char * result = malloc(*result_size);
-	struct iphdr *ip4h = (struct iphdr *) result;
-	struct udphdr *udph = (struct udphdr *) (((char*) ip4h) + sizeof(struct iphdr));
-	struct pseudo_udphdr *pudph = (struct pseudo_udphdr *) (((char*) udph) - sizeof(struct pseudo_udphdr));
-	char *udp_data = ((char*) udph) + sizeof(struct udphdr);
-
-	//copy data
-	memcpy(udp_data, data, d_size);
-
-	//set udp header
-	udph->dest = dport;
-	udph->source = sport;
-	udph->len = htons(d_size + sizeof(struct udphdr));
-
-	//set udp pseudo header
-	pudph->dest = daddr;
-	pudph->source = saddr;
-	pudph->zero = 0;
-	pudph->protocol = IPPROTO_UDP;    //IPPROTO_RAW;    /* protocol at L4 */
-	pudph->udp_length = udph->len;
-
-	//checksum
-	udph->check = 0;
-	u_int16_t *addr = (u_int16_t *) pudph;
-	int len = sizeof(struct pseudo_udphdr) + ntohs(pudph->udp_length);
-	u_int32_t sum = 0;
-	while (len > 1)
-	{
-		sum += *addr++;
-		len -= 2;
-	}
-	if (len == 1)
-	{
-		//Prepare for different architectures
-		if (enable_addzero)
-		{
-			u_int8_t tmp = *(u_int8_t *) addr;
-			u_int16_t last = (u_int16_t) (tmp << 8);        // add 0
-			sum += last;
-		}
-		else
-			sum += *(u_int8_t*) addr;
-	}
-	sum = (sum >> 16) + (sum & 0xffff);
-	sum += (sum >> 16);  //add carry
-	udph->check = ~sum;
-
-	//set ipv4 header
-	ip4h->ihl = 5; //header length
-	ip4h->version = 4;
-	ip4h->tos = 0x0;
-	ip4h->id = 0;
-	ip4h->frag_off = htons(0x4000); /* DF */
-	ip4h->ttl = 64; /* default value */
-	ip4h->protocol = IPPROTO_UDP;    //IPPROTO_RAW;    /* protocol at L4 */
-	ip4h->check = 0; /* not needed in iphdr */
-	ip4h->saddr = saddr;
-	ip4h->daddr = daddr;
-
-	return result;
-}
-
 static void on_read_from_proxy(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf, const struct sockaddr* addr, unsigned flags)
 {
 	if (!addr)
@@ -245,8 +154,12 @@ static void on_read_from_proxy(uv_udp_t* handle, ssize_t nread, const uv_buf_t* 
 
 		uint saddr = map->peer_addr.ipaddr_remote, daddr = map->peer_addr.ipaddr_local;
 		u_int16_t sport = map->peer_addr.port_remote, dport = map->peer_addr.port_local;
-		size_t udp_packet_size;
-		char * udp_packet = proxy_get_udp_packet(buf->base, nread, &udp_packet_size, saddr, daddr, sport, dport);
+		size_t ip_packet_size;
+		char * ip_packet;
+		if(map->protocol == IPPROTO_UDP)
+			ip_packet = build_udpip_packet(buf->base, nread, &ip_packet_size, saddr, daddr, sport, dport);
+		else
+			ip_packet = build_tcpip_packet(buf->base, nread, &ip_packet_size, saddr, daddr, sport, dport);
 
 		struct sockaddr_in daddr_in;
 		bzero(&daddr_in, sizeof(daddr_in));
@@ -254,10 +167,10 @@ static void on_read_from_proxy(uv_udp_t* handle, ssize_t nread, const uv_buf_t* 
 		daddr_in.sin_addr.s_addr = daddr;
 
 		LOG("RAW SOCK SED: F[0x%08x %05d] T[0x%08x %05d]\n", saddr, ntohs(sport), daddr, ntohs(dport));
-		if (sendto(raw_sock, udp_packet, udp_packet_size, 0, (struct sockaddr *) &daddr_in, (socklen_t) sizeof(daddr_in)) < 0)
+		if (sendto(raw_sock, ip_packet, ip_packet_size, 0, (struct sockaddr *) &daddr_in, (socklen_t) sizeof(daddr_in)) < 0)
 			ERROR("raw socket sendto()\n");
 
-		free(udp_packet);
+		free(ip_packet);
 
 		//update time
 		map->new = 0;
@@ -278,19 +191,35 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 	u_char *pkg_data;
 	uint pkg_data_len = nfq_get_payload(nfa, &pkg_data);
 	struct iphdr *ip4h = (struct iphdr *) pkg_data;
-	struct udphdr *udph = (struct udphdr *) (pkg_data + (ip4h->ihl * 4));
-
-	u_char *udp_data = ((u_char*) udph) + sizeof(struct udphdr);
-	size_t udp_size = pkg_data_len - sizeof(struct udphdr) - (ip4h->ihl * 4);
+	size_t ip4h_size = ip4h->ihl * 4;
+	Socket *socket = (Socket *) (pkg_data + ip4h_size);
 
 	//save IP & port
 	ClientAddr peer_addr;
 	peer_addr.ipaddr_local = ip4h->saddr;
-	peer_addr.port_local = udph->source;
+	peer_addr.port_local = socket->port.s;
 	peer_addr.ipaddr_remote = ip4h->daddr;
-	peer_addr.port_remote = udph->dest;
+	peer_addr.port_remote = socket->port.d;
 
-//	LOG("UDP size: %d\n", udp_size);
+	//udp or tcp
+	u_char *payload;
+	size_t payload_size;
+	if(ip4h->protocol == IPPROTO_UDP)
+	{
+		payload = ((u_char*) socket) + sizeof(struct udphdr);
+		payload_size = pkg_data_len - sizeof(struct udphdr) - ip4h_size;
+	}
+	else if (ip4h->protocol == IPPROTO_TCP)
+	{
+		//*4 = SequenceNumber(4), *16 = Checksum(2) + UrgentPointer(2)
+		memcpy(((u_char*) socket) + 16, ((u_char*) socket) + 4, 4);
+		//8 = src(2) + dst(2) + Checksum(2) + UrgentPointer(2)
+		payload = ((u_char*) socket) + 8;
+		payload_size = pkg_data_len - ip4h_size - 8;
+	}
+	else
+		return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+
 
 	ClientPortMap * map;
 	DL_SEARCH(client_map_head, map, &peer_addr, client_find_by_addr)
@@ -307,6 +236,7 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		map->time_handshake.tv_sec = 0;
 		map->peer_addr = peer_addr;
 		map->waiting_handshake_data.len = 0;
+		map->protocol = ip4h->protocol;
 
 		uv_udp_init(loop, &map->local_sock);
 		uv_udp_recv_start(&map->local_sock, alloc_buffer, on_read_from_proxy);
@@ -322,7 +252,7 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 			EstablishPacket * ep;
 
 			// non-fastopen, save data to waiting buffer
-			if(sizeof(EstablishPacket)+udp_size > UDPROXY_FO_MAX)
+			if(sizeof(EstablishPacket)+payload_size > UDPROXY_FO_MAX)
 			{
 				// create non-fastopen Handshake packet
 				buf = uv_buf_init(malloc(sizeof(EstablishPacket)), sizeof(EstablishPacket));
@@ -330,29 +260,30 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 
 				if(map->waiting_handshake_data.len > 0)
 					free(map->waiting_handshake_data.base);
-				map->waiting_handshake_data.len = udp_size;
-				map->waiting_handshake_data.base = malloc(udp_size);
+				map->waiting_handshake_data.len = payload_size;
+				map->waiting_handshake_data.base = malloc(payload_size);
 				// copy non-fastopen data packet to waiting send field
-				memcpy(map->waiting_handshake_data.base, udp_data, udp_size);
+				memcpy(map->waiting_handshake_data.base, payload, payload_size);
 			}
 			// fastopen
 			else
 			{
-				buf = uv_buf_init(malloc(sizeof(EstablishPacket)+udp_size), sizeof(EstablishPacket)+udp_size);
+				buf = uv_buf_init(malloc(sizeof(EstablishPacket)+payload_size), sizeof(EstablishPacket)+payload_size);
 				ep = (EstablishPacket*) buf.base;
-				memcpy(ep->data, udp_data, udp_size);
+				memcpy(ep->data, payload, payload_size);
 			}
 
 			ep->magic_number = UDPROXY_MN;
 			ep->remote_addr = ip4h->daddr;
-			ep->remote_port = udph->dest;
+			ep->remote_port = socket->port.d;
+			ep->protocol = ip4h->protocol;
 
 			// DNAT match search
 			if(client_dnatmap_head)
 			{
 				struct sockaddr_in naddr;
 				naddr.sin_addr.s_addr = ip4h->daddr;
-				naddr.sin_port = udph->dest;
+				naddr.sin_port = socket->port.d;
 				ClientDnatMap * dnat = NULL;
 				DL_SEARCH(client_dnatmap_head, dnat, &naddr, client_dnat_find_by_addr)
 						;
@@ -372,14 +303,14 @@ static int on_read_from_nfqueue(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		}
 		else
 		{
-			buf = uv_buf_init(malloc(udp_size), udp_size);
-			memcpy(buf.base, udp_data, udp_size);
+			buf = uv_buf_init(malloc(payload_size), payload_size);
+			memcpy(buf.base, payload, payload_size);
 		}
 	}
 	else
 	{
-		buf = uv_buf_init(malloc(udp_size), udp_size);
-		memcpy(buf.base, udp_data, udp_size);
+		buf = uv_buf_init(malloc(payload_size), payload_size);
+		memcpy(buf.base, payload, payload_size);
 	}
 	// send handshake packet or raw data
 	udproxy_udp_send(&map->local_sock, &buf, 1, &proxy_sockaddr);
