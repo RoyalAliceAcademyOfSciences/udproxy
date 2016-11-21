@@ -156,6 +156,7 @@ static void on_read_from_client(uv_udp_t* handle, ssize_t nread, const uv_buf_t*
 				send_data.base = malloc(ep_data_len);
 				send_data.len = ep_data_len;
 				memcpy(send_data.base, ep->data, ep_data_len);
+				//todo TCP
 				udproxy_udp_send(&map->remote_sock, &send_data, 1, &map->remote_addr);
 			}
 			//tell the client: connection established.
@@ -167,12 +168,14 @@ static void on_read_from_client(uv_udp_t* handle, ssize_t nread, const uv_buf_t*
 		{
 			map->unhandshaked = 0;
 			uv_buf_t send_data = copy_buffer(buf, nread);
+			//todo TCP
 			udproxy_udp_send(&map->remote_sock, &send_data, 1, &map->remote_addr);
 		}
 	}
 	else
 	{
 		uv_buf_t send_data = copy_buffer(buf, nread);
+		//todo TCP
 		udproxy_udp_send(&map->remote_sock, &send_data, 1, &map->remote_addr);
 	}
 
