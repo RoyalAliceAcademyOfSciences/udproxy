@@ -34,7 +34,6 @@ typedef struct establishPacket
 	uint magic_number;
 	uint remote_addr;
 	u_int16_t remote_port;
-	u_char protocol;
 	u_char data[];
 } EstablishPacket;
 
