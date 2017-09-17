@@ -132,15 +132,21 @@ static void on_read_from_client(uv_udp_t* handle, ssize_t nread, const uv_buf_t*
 		map->new = 1;
 		map->unhandshaked = 1;
 
-		memcpy(&map->client_addr, src_addr, sizeof(struct sockaddr));
+        if(ep->protocol == IPPROTO_UDP)
+        {
+            memcpy(&map->client_addr, src_addr, sizeof(struct sockaddr));
 
-		struct sockaddr_in * remote_addr = (struct sockaddr_in*) (&map->remote_addr);
-		remote_addr->sin_addr.s_addr = ep->remote_addr;
-		remote_addr->sin_port = ep->remote_port;
-		remote_addr->sin_family = AF_INET;
+            struct sockaddr_in * remote_addr = (struct sockaddr_in*) (&map->remote_addr);
+            remote_addr->sin_addr.s_addr = ep->remote_addr;
+            remote_addr->sin_port = ep->remote_port;
+            remote_addr->sin_family = AF_INET;
 
-		uv_udp_init(loop, &map->remote_sock);
-		uv_udp_recv_start(&map->remote_sock, alloc_buffer, on_read_from_remote);
+            uv_udp_init(loop, &map->remote_sock);
+            uv_udp_recv_start(&map->remote_sock, alloc_buffer, on_read_from_remote);
+        }
+        else if (ep->protocol == IPPROTO_TCP) {
+            //todo TCP
+        }
 		LOG("NEW RECV HS PKT: 0x%08x %05d  PLD LEN:%04zu\n", ep->remote_addr, ntohs(ep->remote_port), nread);
 	}
 

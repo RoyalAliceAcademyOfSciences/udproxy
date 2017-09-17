@@ -158,7 +158,7 @@ static void on_read_from_proxy(uv_udp_t* handle, ssize_t nread, const uv_buf_t* 
 		char * ip_packet;
 		if(map->protocol == IPPROTO_UDP)
 			ip_packet = build_udpip_packet(buf->base, nread, &ip_packet_size, saddr, daddr, sport, dport);
-		else
+        else if(map->protocol == IPPROTO_TCP)
 			ip_packet = build_tcpip_packet(buf->base, nread, &ip_packet_size, saddr, daddr, sport, dport);
 
 		struct sockaddr_in daddr_in;
